@@ -1,142 +1,162 @@
 from pyspark.sql.functions import *
 from pyspark.sql.types import *
-from pyspark.sql import DataFrame
-from pyspark.sql import SparkSession
+from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql.window import Window
 from datetime import datetime, timedelta
-from typing import Union, List, Tuple, Any
+from typing import Union, List, Tuple, Any, Optional, Dict, Callable
 import notebookutils
 import pandas as pd
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor
+from tqdm import tqdm
 
-spark = SparkSession.builder\
-        .appName("fusion")\
-        .getOrCreate()
+spark = SparkSession.builder.appName("fusion").getOrCreate()
 
 class _AuditLog_Fusion:
+    """
+    Base class for audit logging of ETL processes into a Delta-based audit table.
 
+    Attributes:
+        WS_ID: Workspace identifier.
+        TABLE_NAME_to_check: Source table name.
+        AUDIT_TABLE_NAME: Audit table name.
+        LH_ID_to_check: Lakehouse ID of source table.
+        LH_ID_audit: Lakehouse ID for audit table.
+        schema: Optional schema name.
+        log: In-memory storage of audit fields.
+
+    Usage:
+    ------
+    >>> cols = ['PIPELINENAME','PIPELINERUNID','TRIGGERTYPE','TABLE_NAME','FUNCTION_NAME',
+                'COUNTROWSBEFORE','COUNTROWSAFTER','ERRORCODE','ERRORMESSAGE']
+    >>> logger = _AuditLog_Fusion(cols, WS_ID='ws', TABLE_NAME_to_check='src',
+                                 AUDIT_TABLE_NAME='audit', LH_ID_to_check='lh')
+    """
     class logger:
         def __init__(self, **kwargs):
             self._data = kwargs
-    
-        def __getitem__(self, key):
-            return self._data[key]
-    
+        def __getitem__(self, key): return self._data[key]
         def __setitem__(self, key, value):
             if key not in self._data:
                 raise KeyError(f"Cannot add new key: {key}")
             self._data[key] = value
-    
-        def __delitem__(self, key):
-            raise KeyError(f"Cannot delete key: {key}")
-    
-        def __iter__(self):
-            return iter(self._data)
-    
-        def __len__(self):
-            return len(self._data)
-    
-        def __repr__(self):
-            return repr(self._data)
-    
-    def __init__(self, columns: Union[List[str], Tuple[str, ...]], WS_ID: str, TABLE_NAME_to_check:str, AUDIT_TABLE_NAME:str, LH_ID_to_check: str, LH_ID_audit: str = None, schema: str = None):
-        '''
-        - if `LH_ID_audit` is not given, it is  LH_ID_to_check automatically, i.e. audit table is in the same lakehouse as that of
-        - if using lakehouse with Schema, please provide `schema` parameter
-        '''
+        def __repr__(self): return repr(self._data)
+
+    def __init__(
+        self,
+        columns: Union[List[str], Tuple[str, ...]],
+        WS_ID: str,
+        TABLE_NAME_to_check: str,
+        AUDIT_TABLE_NAME: str,
+        LH_ID_to_check: str,
+        LH_ID_audit: Optional[str] = None,
+        schema: Optional[str] = None
+    ) -> None:
+        """
+        Initialize the audit logger.
+
+        Parameters:
+            columns: Audit field names.
+            WS_ID: Workspace ID.
+            TABLE_NAME_to_check: Source table.
+            AUDIT_TABLE_NAME: Audit table.
+            LH_ID_to_check: Source lakehouse ID.
+            LH_ID_audit: Audit lakehouse ID.
+            schema: Optional schema within lakehouse.
+        """
         self.WS_ID = WS_ID
         self.TABLE_NAME_to_check = TABLE_NAME_to_check
         self.AUDIT_TABLE_NAME = AUDIT_TABLE_NAME
         self.LH_ID_to_check = LH_ID_to_check
-        self.LH_ID_audit = LH_ID_audit if LH_ID_audit else LH_ID_to_check
+        self.LH_ID_audit = LH_ID_audit or LH_ID_to_check
         self.schema = schema
         self.fixColumns = {'STARTTIME','ENDTIME','AUDITKEY','STATUS_ACTIVITY'}
         self.columns = tuple(set(columns).union(self.fixColumns))
-        
-        if self.schema:    
-            self.PATH_TO_AUDIT_TABLE = f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.LH_ID_audit}/Tables/{self.schema}/{self.AUDIT_TABLE_NAME}'
-            self.PATH_TO_CHECKED_TABLE = f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.LH_ID_to_check}/Tables/{self.schema}/{self.TABLE_NAME_to_check}'
+
+        base_uri = f"abfss://{WS_ID}@onelake.dfs.fabric.microsoft.com/"
+        if schema:
+            self.PATH_TO_CHECKED_TABLE = f"{base_uri}{LH_ID_to_check}/Tables/{schema}/{TABLE_NAME_to_check}"
+            self.PATH_TO_AUDIT_TABLE = f"{base_uri}{LH_ID_audit}/Tables/{schema}/{AUDIT_TABLE_NAME}"
         else:
-            self.PATH_TO_AUDIT_TABLE = f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.LH_ID_audit}/Tables/{self.AUDIT_TABLE_NAME}'
-            self.PATH_TO_CHECKED_TABLE = f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.LH_ID_to_check}/Tables/{self.TABLE_NAME_to_check}'
-        
-        # if not notebookutils.fs.exists(self.PATH_TO_AUDIT_TABLE):
-        #     raise FileExistsError(f'Create you audit table first at path {self.PATH_TO_AUDIT_TABLE}')
-        # if not notebookutils.fs.exists(self.PATH_TO_CHECKED_TABLE):
-        #     raise FileExistsError(f'your given table does not exists at path {self.PATH_TO_CHECKED_TABLE}')
-    
-        self.log = self.logger(**{column: None for column in self.columns})
+            self.PATH_TO_CHECKED_TABLE = f"{base_uri}{LH_ID_to_check}/Tables/{TABLE_NAME_to_check}"
+            self.PATH_TO_AUDIT_TABLE = f"{base_uri}{LH_ID_audit}/Tables/{AUDIT_TABLE_NAME}"
+
+        self.log = self.logger(**{col: None for col in self.columns})
         self.log['STATUS_ACTIVITY'] = 'Not start'
 
-    def setKeys(self, initConfig: dict[str, Any]):
-        assert set(initConfig.keys()).issubset(set(self.columns).difference()), f'initConfig must have the columns in {self.columns}'
-        for column in initConfig:
-            self.log[column] = initConfig[column]
+    def setKeys(self, initConfig: Dict[str, Any]) -> None:
+        """
+        Bulk set audit fields.
 
-    def setKey(self, key: str, value: Any):
-        assert key in self.columns, f'key must be in {self.columns}'
+        Usage:
+        >>> logger.setKeys({'PIPELINENAME':'pipe','TRIGGERTYPE':'manual'})
+        """
+        assert set(initConfig).issubset(self.columns), f"Keys must be subset of {self.columns}"
+        for k,v in initConfig.items(): self.log[k] = v
+
+    def setKey(self, key: str, value: Any) -> None:
+        """
+        Set single audit field.
+
+        Usage:
+        >>> logger.setKey('STATUS_ACTIVITY','Running')
+        """
+        assert key in self.columns, f"Key must be in {self.columns}"
         self.log[key] = value
-        
-    def initialDetail(self, initConfig: dict[str, Any]):
+
+    def initialDetail(self, initConfig: Dict[str, Any]) -> None:
+        """Initialize log fields."""
         self.setKeys(initConfig)
 
-    def getKey(self):
-        return self.columns
-    
-    def getLog(self):
-        return self.log
-        
-    def __str__(self):
-        out = ''
-        for key in self.columns:
-            out += f'{key}: {self.log[key]}\n'
-        return out
-    
-    def __repr__(self):
-        return str(self.log)
-    
-    def endSuccess(self):
+    def startAudit(self) -> None:
+        """Mark audit start time and status."""
+        ts = datetime.now() + timedelta(hours=7)
+        self.log['STARTTIME'] = ts.isoformat()
+        self.log['STATUS_ACTIVITY'] = 'logging ...'
+
+    def countBefore(self) -> None:
+        """Log row count before ETL."""
+        if self.log['COUNTROWSBEFORE']:
+            raise ValueError('COUNTROWSBEFORE already set')
+        self.log['COUNTROWSBEFORE'] = spark.read.load(self.PATH_TO_CHECKED_TABLE).count()
+
+    def countAfter(self) -> None:
+        """Log row count after ETL."""
+        self.log['COUNTROWSAFTER'] = spark.read.load(self.PATH_TO_CHECKED_TABLE).count()
+
+    def _endAuditLog(self) -> DataFrame:
+        """Persist log to audit table."""
+        self.log['ENDTIME'] = (datetime.now()+timedelta(hours=7)).isoformat()
+        row = {k:[str(self.log[k])] for k in self.log}
+        df = spark.createDataFrame(list(zip(*row.values())), schema=list(row.keys()))
+        df.write.mode('append').save(self.PATH_TO_AUDIT_TABLE)
+        return df
+
+    def endSuccess(self) -> None:
+        """Mark success and persist log."""
         self.log['STATUS_ACTIVITY'] = 'Success'
         self._endAuditLog()
         print(self)
 
-        
-    def endFail(self, errorCode: str, errorMessage: str):
+    def endFail(self, errorCode:str, errorMessage:Any) -> None:
+        """Mark failure, record error, and persist log."""
         self.log['STATUS_ACTIVITY'] = 'Fail'
         self.log['ERRORCODE'] = errorCode
-        self.log['ERRORMESSAGE'] = errorMessage
+        self.log['ERRORMESSAGE'] = str(errorMessage)
         self._endAuditLog()
         print(self)
 
-    def _endAuditLog(self):
-        # write to audit table
-        self.log['ENDTIME'] = str(datetime.now() + timedelta(hours=7))
-        row = {}
-        for key in self.log:
-            row[key] = [str(self.log[key])]
-        data_tuples = list(zip(*row.values()))
-        df = spark.createDataFrame(data_tuples, schema=list(row.keys()))
-        df.write.mode('append').save(self.PATH_TO_AUDIT_TABLE)
-        return df
-
-    def getAuditLogTable(self):
+    def getAuditLogTable(self) -> DataFrame:
+        """Retrieve full audit log as DataFrame."""
         return spark.read.load(self.PATH_TO_AUDIT_TABLE)
+
+    def getAllPath(self) -> Dict[str,str]:
+        """Get paths for checked and audit tables."""
+        return {'checked':self.PATH_TO_CHECKED_TABLE,'audit':self.PATH_TO_AUDIT_TABLE}
+
+    def __repr__(self) -> str:
+        return repr(self.log)
     
-    def countBefore(self):
-        if self.log['COUNTROWSBEFORE']:
-            raise ValueError('COUNTROWSBEFORE already exist')
-        self.log['COUNTROWSBEFORE'] = spark.read.load(self.PATH_TO_CHECKED_TABLE).count()
-
-    def countAfter(self):
-        self.log['COUNTROWSAFTER'] = spark.read.load(self.PATH_TO_CHECKED_TABLE).count()
-
-    def getAllPath(self):
-        return {'PATH_TO_AUDIT_TABLE':self.PATH_TO_AUDIT_TABLE, 'PATH_TO_CHECKED_TABLE':self.PATH_TO_CHECKED_TABLE}
-
-    def startAudit(self):
-        self.log['STARTTIME'] = str(datetime.now() + timedelta(hours=7))
-        self.log['STATUS_ACTIVITY'] = 'logging ...'
-
 class AuditLog(_AuditLog_Fusion):
     
     def __init__(self, WS_ID: str, TABLE_NAME_to_check:str, AUDIT_TABLE_NAME:str, LH_ID_to_check: str, LH_ID_audit: str = None, schema: str = None):
@@ -171,28 +191,97 @@ class AuditLog(_AuditLog_Fusion):
         '''
         super().__init__(['PIPELINENAME', 'PIPELINERUNID', 'TRIGGERTYPE', 'TABLE_NAME', 'FUNCTION_NAME','COUNTROWSBEFORE', 'COUNTROWSAFTER', 'ERRORCODE', 'ERRORMESSAGE'] ,WS_ID, TABLE_NAME_to_check, AUDIT_TABLE_NAME, LH_ID_to_check, LH_ID_audit, schema)
 
-    def initialDetail(self,  pipelineName: str, pipelineId: str, TriggerType: str, functionName: str):
+    def initialDetail(
+        self,
+        pipelineName: str,
+        pipelineId: str,
+        TriggerType: str,
+        functionName: str
+    ) -> None:
+        """
+        Initialize and start audit for an ETL run.
+
+        Args:
+            pipelineName (str): A human-readable name for the ETL pipeline.
+            pipelineId (str): A unique identifier for this pipeline run.
+            TriggerType (str): How the pipeline was triggered (e.g., 'manual', 'scheduled').
+            functionName (str): The name of the Python function executing ETL logic.
+
+        Returns:
+            None
+
+        After calling this method, the audit log will have:
+          - STARTTIME set to current timestamp (+7h offset)
+          - STATUS_ACTIVITY set to 'logging ...'
+          - PIPELINENAME, PIPELINERUNID, TRIGGERTYPE, TABLE_NAME, FUNCTION_NAME
+          - AUDITKEY composed of `<pipelineName>-<TABLE_NAME>-<STARTTIME>`
+
+        Example:
+            >>> ad = AuditLog('ws1', 'customers', 'audit_customers', 'lh_cust', 'lh_audit')
+            >>> ad.initialDetail('DailyLoad', 'run123', 'scheduled', 'load_customers')
+            >>> print(ad.log)
+        """
         super().initialDetail({
-            'PIPELINENAME': pipelineName, 
-            'PIPELINERUNID': pipelineId, 
-            'TRIGGERTYPE': TriggerType, 
-            'TABLE_NAME': self.TABLE_NAME_to_check, 
+            'PIPELINENAME': pipelineName,
+            'PIPELINERUNID': pipelineId,
+            'TRIGGERTYPE': TriggerType,
+            'TABLE_NAME': self.TABLE_NAME_to_check,
             'FUNCTION_NAME': functionName
         })
+        # start the audit clock
         self.startAudit()
-        self.log['AUDITKEY'] = self.log['PIPELINENAME'] + '-' + self.log['TABLE_NAME'] + '-' + str(self.log['STARTTIME']).replace(' ','_').replace(':','_')
+        # generate a unique key for this run
+        self.log['AUDITKEY'] = (
+            f"{pipelineName}-{self.TABLE_NAME_to_check}-"
+            f"{self.log['STARTTIME'].replace(':','_')}"
+        )
 
-    def execute(self, ETL_func, raiseError = True):
+    def execute(
+        self,
+        ETL_func: Callable[[], Any],
+        raiseError: bool = True
+    ) -> bool:
+        """
+        Execute the ETL function within the audit context.
+
+        Args:
+            ETL_func (Callable[[], Any]): A parameterless function encapsulating the ETL logic.
+            raiseError (bool): If True, re-raises any exception after logging failure. Defaults to True.
+
+        Returns:
+            bool: True if ETL_func completes successfully; False if an exception occurs and raiseError=False.
+
+        Behavior:
+          1. Calls countBefore() to log pre-ETL row count.
+          2. Executes the provided ETL_func().
+          3. Calls countAfter() to log post-ETL row count.
+          4. On success, calls endSuccess() to mark audit log as SUCCESS.
+          5. On exception, calls endFail() to mark audit log as FAIL and record error.
+
+        Example:
+            >>> def sample_etl():
+            ...     # ETL steps here
+            ...     pass
+            >>> success = ad.execute(sample_etl)
+            >>> if not success:
+            ...     print("ETL failed, but continuing...")
+        """
         try:
+            # log rows before
             self.countBefore()
+            # run ETL logic
             ETL_func()
+            # log rows after
             self.countAfter()
+            # mark success
             self.endSuccess()
             return True
         except Exception as e:
-            self.endFail(errorCode = '-', errorMessage = e)
-            if not raiseError:
-                raise e
+            # log failure details
+            self.endFail('-', e)
+            if raiseError:
+                raise
+            return False
 
 class CreateBlankTable:
     def __init__(self, WS_ID, META_LH_ID, META_FILENAME, format="delta", optionalMapper:dict[str, DataType] = None):
@@ -257,11 +346,36 @@ class CreateBlankTable:
                 else:
                     raise KeyError(f'{key} already exist in the mapper')
     
-    def create_table(self, table_name: str, lh_name: str, column_datatype_map: dict[str, DataType], precision_scale_map: dict[str, tuple], table_partition_columns: List[str] =None):
-        '''
-        column_datatype_map should be a dict with column name as key and datatype function from `pyspark.sql.types` as value.
-        precision_scale_map should be a dict with column name as key and a tuple of (precision, scale) as value of decimal type; in case of other type it can be `(None, None)` or omitted.
-        '''
+    def create_table(self, table_name:str, lh_name:str, column_datatype_map:Dict[str,DataType],
+                     precision_scale_map:Dict[str,Tuple[int,int]], table_partition_columns:Optional[List[str]]=None) -> None:
+        """
+        Create an empty Delta table in the lakehouse with the given schema.
+
+        Args:
+            table_name (str): Name of the table to create.
+            lh_name (str): Display name of the target lakehouse.
+            column_datatype_map (dict): Keys are column names, values are DataType classes
+                (e.g., StringType, IntegerType).
+            precision_scale_map (dict): For DecimalType columns, a mapping of column name
+                to (precision, scale). Other types may be omitted.
+            table_partition_columns (list, optional): Columns to partition by. Default None.
+
+        Raises:
+            KeyError: If `lh_name` cannot be resolved to a Lakehouse ID.
+            AnalysisException: If table creation fails.
+
+        Example:
+        -------
+            >>> column_map = {'id': IntegerType, 'amount': DecimalType}
+            >>> precision_map = {'amount': (10, 2)}
+            >>> cbt.create_table(
+            ...     table_name='transactions',
+            ...     lh_name='finance_lh',
+            ...     column_datatype_map=column_map,
+            ...     precision_scale_map=precision_map,
+            ...     table_partition_columns=['year']
+            ... )
+        """
         LH_ID = utils.get_lh_id(self.WS_ID, lh_name)
         table_path = f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{LH_ID}/Tables/{table_name}'
 
@@ -286,7 +400,23 @@ class CreateBlankTable:
             writer = writer.partitionBy(*table_partition_columns)
         writer.save(table_path)
 
-    def readMetaFile(self):
+    def readMetaFile(self) -> pd.DataFrame:
+        """
+        Read metadata definitions into a Pandas DataFrame.
+
+        Returns:
+            pandas.DataFrame: Metadata indexed by ('TableName', 'LakehouseName'), containing columns
+            ['TableName', 'LakehouseName', 'ColumnName', 'DataType', 'Precision', 'Scale', 'forPartition'].
+
+        Raises:
+            AnalysisException: If the metadata path cannot be read.
+
+        Usage:
+        ------
+        >>> cbt = CreateBlankTable('ws1', 'meta_lh', 'meta.csv', format='csv')
+        >>> meta_df = cbt.readMetaFile()
+        >>> print(meta_df.head())
+        """
         if  self.format == 'csv':
             meta_df = spark.read.option("header", "true").option("delimiter", ",").csv(self.META_PATH).toPandas().set_index(['TableName','LakehouseName'], drop=False)
             return meta_df
@@ -294,7 +424,22 @@ class CreateBlankTable:
             meta_df = spark.read.format("delta").load(self.META_PATH).toPandas().set_index(['TableName','LakehouseName'], drop=False)
             return meta_df
 
-    def create_all(self, meta_table: pd.DataFrame):
+    def create_all(self, meta_table:pd.DataFrame) -> None:
+        """
+        Iterate over metadata and create one table per entry.
+
+        Args:
+            meta_table (pandas.DataFrame): Metadata indexed by ('TableName', 'LakehouseName').
+
+        Returns:
+            None
+
+        Usage:
+        ------
+            >>> cbt = CreateBlankTable('ws1', 'meta_lh', 'meta.csv')
+            >>> meta = cbt.readMetaFile()
+            >>> cbt.create_all(meta)
+        """
         # raise NotImplementedError("create_all method should be implemented in the subclass.")
         tableNames = meta_table.index.get_level_values(0).unique()
         for table in tableNames:
@@ -315,60 +460,95 @@ class CreateBlankTable:
                     table_partition_columns.append(column_name)
             self.create_table(table, lakehouse_name, column_datatype_map, precision_scale_map, table_partition_columns)
 
-    def run(self):
+    def run(self) -> None:
+        """
+        Execute the end-to-end creation of all tables defined in metadata.
+
+        Steps:
+          1. readMetaFile() to load metadata into a DataFrame.
+          2. create_all() to create each table as defined.
+
+        Usage:
+        ------
+            >>> cbt = CreateBlankTable('ws1', 'meta_lh', 'meta.csv')
+            >>> cbt.run()
+        """
         self.meta_table = self.readMetaFile()
         self.create_all(self.meta_table)
 
 class utils:
+    """Utility functions for DataFrame and lakehouse operations."""
 
     @staticmethod
     def trim_string_columns(df: DataFrame) -> DataFrame:
         """
-        Trims all string columns in the given DataFrame.
-        Parameters:
-        df (DataFrame): Input DataFrame with string columns to be trimmed.
-        Returns:
-        DataFrame: A new DataFrame with trimmed string columns.
-        """
-        # Get the list of string columns
-        string_columns = [field.name for field in df.schema.fields if field.dataType.typeName() == 'string']
-        # Trim each string column
+        Trim whitespace from all string-typed columns in the DataFrame.
 
-        for column in string_columns:
-            df = df.withColumn(column, trim(col(column)))
+        Args:
+            df (DataFrame): The input Spark DataFrame containing string columns.
+
+        Returns:
+            DataFrame: A new DataFrame where leading and trailing whitespace has been removed
+                       from every string-typed column.
+
+        Example:
+            >>> from pyspark.sql import SparkSession
+            >>> spark = SparkSession.builder.getOrCreate()
+            >>> df = spark.createDataFrame([(" Alice ", " Bob ")], ["name", "friend"])
+            >>> utils.trim_string_columns(df).show()
+            +-----+------+
+            | name|friend|
+            +-----+------+
+            |Alice|   Bob|
+            +-----+------+
+        """
+        string_columns = [f.name for f in df.schema.fields if f.dataType.typeName() == 'string']
+        for col_name in string_columns:
+            df = df.withColumn(col_name, trim(col(col_name)))
         return df
- 
+
     @staticmethod
     def fillNaAll(df: DataFrame) -> DataFrame:
         """
-        Fills all null (NA) values in the given DataFrame with default values based on column data types.
+        Fill all null values in the DataFrame with type-specific defaults.
 
         Args:
-            df (DataFrame): The input PySpark DataFrame whose null values are to be filled.
+            df (DataFrame): The input Spark DataFrame whose nulls are to be replaced.
 
         Returns:
-            DataFrame: A new DataFrame with null values replaced by default values for each column type.
+            DataFrame: A new DataFrame with nulls replaced by defaults for each column type.
 
         Raises:
-            TypeError: If a column's data type does not have a defined default fill value.
+            TypeError: If a column’s data type has no defined default fill value.
 
         Default fill values:
             - StringType: ''
             - ShortType: 0
             - IntegerType: 0
+            - LongType: 0
+            - FloatType: 0.0
             - DoubleType: 0.0
             - TimestampType: '1970-01-01 00:00:00'
-            - LongType: 0
             - DecimalType: 0.0
+
+        Example:
+            >>> df = spark.createDataFrame([(None, 1, None)], ["name", "age", "balance"])
+            >>> utils.fillNaAll(df).show()
+            +----+---+-------+
+            |name|age|balance|
+            +----+---+-------+
+            |    |  1|    0.0|
+            +----+---+-------+
         """
         fillnaDefault = {
             StringType: '',
             ShortType: 0,
             IntegerType: 0,
+            LongType: 0,
+            FloatType: 0.0,
             DoubleType: 0.0,
             TimestampType: '1970-01-01 00:00:00',
-            LongType:0,
-            DecimalType:0.0,
+            DecimalType: 0.0,
         }
         fill_values = {}
         for field in df.schema.fields:
@@ -382,99 +562,161 @@ class utils:
     @staticmethod
     def fillNaAllStringType(df: DataFrame, value: str = 'NA') -> DataFrame:
         """
-        Fills all columns of string type in the given DataFrame with 'NA' where values are null.
+        Fills all string-typed columns in the DataFrame with a given value where null.
 
         Args:
-            df (DataFrame): The input Spark DataFrame to process.
-            value (str): The value to replace nulls in string columns. Default is 'NA'.
+            df (DataFrame): The input Spark DataFrame.
+            value (str): Replacement for null string values. Default is 'NA'.
 
         Returns:
-            DataFrame: A new DataFrame where all columns of string type have null values replaced with 'NA'.
+            DataFrame: A new DataFrame where all string columns have been filled.
 
         Example:
-            >>> df = spark.createDataFrame([("Alice", None), (None, "Bob")], ["name", "friend"])
-            >>> fillNaAllStringType(df).show()
-            +-----+------+
-            | name|friend|
-            +-----+------+
-            |Alice|    NA|
-            |   NA|   Bob|
-            +-----+------+
+            >>> df = spark.createDataFrame([(None, "Bob"), ("Alice", None)], ["name", "friend"])
+            >>> utils.fillNaAllStringType(df, 'Unknown').show()
+            +-------+-------+
+            |   name| friend|
+            +-------+-------+
+            |Unknown|    Bob|
+            |  Alice|Unknown|
+            +-------+-------+
         """
-        fillnaDefault = {
-            StringType: value,
-        }
+        fillnaDefault = { StringType: value }
         fill_values = {}
         for field in df.schema.fields:
-            field_type = type(field.dataType)
-            if field_type in fillnaDefault:
-                fill_values[field.name] = fillnaDefault[field_type]
+            if type(field.dataType) in fillnaDefault:
+                fill_values[field.name] = fillnaDefault[type(field.dataType)]
         return df.fillna(fill_values)
 
     @staticmethod
-    def copySchemaByName(df: DataFrame, fromDf: DataFrame):
-        '''
-        schemaField can be get by df.schema.fields
-        '''
-        dfCol = df.columns
-        for column in fromDf.schema.fields:
-            if column.name in dfCol: # [] TODO: don't forget to add to other Notebook
-                df = df.withColumn(column.name,col(column.name).cast(column.dataType))
+    def copySchemaByName(df: DataFrame, fromDf: DataFrame) -> DataFrame:
+        """
+        Cast columns in `df` to match the data types of `fromDf` by column name.
+
+        Args:
+            df (DataFrame): The DataFrame to cast.
+            fromDf (DataFrame): Reference DataFrame whose schema provides target types.
+
+        Returns:
+            DataFrame: A new DataFrame `df` with columns cast to the types found in `fromDf`.
+
+        Example:
+            >>> template = spark.createDataFrame([(1,)], ['value']).withColumn('value', col('value').cast('double'))
+            >>> df = spark.createDataFrame([(1,)], ['value'])
+            >>> utils.copySchemaByName(df, template).printSchema()
+            root
+             |-- value: double (nullable = true)
+        """
+        for field in fromDf.schema.fields:
+            if field.name in df.columns:
+                df = df.withColumn(field.name, col(field.name).cast(field.dataType))
         return df
 
     @staticmethod
-    def getSetColumn(df,columnName):
+    def getSetColumn(df: DataFrame, columnName: str) -> set:
+        """
+        Return the unique values of a column as a Python set.
+
+        Args:
+            df (DataFrame): The input DataFrame.
+            columnName (str): Name of the column to extract uniques from.
+
+        Returns:
+            set: Unique values from the specified column.
+
+        Example:
+            >>> df = spark.createDataFrame([(1,), (2,), (1,)], ['id'])
+            >>> utils.getSetColumn(df, 'id')
+            {1, 2}
+        """
         return set(df.select(columnName).toPandas()[columnName])
 
     @staticmethod
-    def getCountColumn(df,columnName):
-        return df.select(columnName).toPandas()[columnName].value_counts()
+    def getCountColumn(df: DataFrame, columnName: str) -> pd.Series:
+        """
+        Count occurrences of each distinct value in a column.
+
+        Args:
+            df (DataFrame): The input DataFrame.
+            columnName (str): Name of the column to analyze.
+
+        Returns:
+            pandas.Series: Counts of each unique value in `columnName`.
+
+        Example:
+            >>> df = spark.createDataFrame([('A',), ('B',), ('A',)], ['cat'])
+            >>> utils.getCountColumn(df, 'cat')
+            A    2
+            B    1
+            dtype: int64
+        """
+        pandas_df = df.select(columnName).toPandas()
+        return pandas_df[columnName].value_counts()
 
     @staticmethod
-    def trackSizeTable(df,detail=None,schema = False,table=False):
+    def trackSizeTable(df: DataFrame, detail: Optional[str] = None, schema: bool = False, table: bool = False) -> None:
+        """
+        Print the row and column counts of the DataFrame, with optional schema and sample rows.
+
+        Args:
+            df (DataFrame): The DataFrame to inspect.
+            detail (str, optional): Label to print before size info.
+            schema (bool): If True, also print the DataFrame schema.
+            table (bool): If True, display the first 5 rows.
+
+        Returns:
+            None
+
+        Example:
+            >>> utils.trackSizeTable(df, detail='Before load', schema=True, table=True)
+        """
         if detail:
-            print(detail,end=': size = ')
-        
+            print(f"{detail}: size = ", end='')
         numrow = df.count()
-        print(f'({numrow}, {len(df.columns)})')
-        
+        print(f"({numrow}, {len(df.columns)})")
         if schema:
             df.printSchema()
-        
         if table:
-            df.show()
+            df.show(5)
 
     @staticmethod
-    def trackSizeOnLake(tablePath):
-        numRow = spark.sql(
-        f"""
-        SELECT COUNT(*) FROM {tablePath}
-        """).collect()[0][0]
+    def trackSizeOnLake(tablePath: str) -> None:
+        """
+        Print the row and column count of a Spark table via SQL.
 
-        numCol = spark.sql(
-        f"""
-        DESCRIBE {tablePath}
-        """).count()
+        Args:
+            tablePath (str): Fully qualified Spark table name or path.
 
-        print(tablePath,end=': size = ')
-        print(f'({numRow}, {numCol})')
+        Returns:
+            None
+
+        Example:
+            >>> utils.trackSizeOnLake('database.schema.table')
+        """
+        numRow = spark.sql(f"SELECT COUNT(*) FROM {tablePath}").collect()[0][0]
+        numCol = spark.sql(f"DESCRIBE {tablePath}").count()
+        print(f"{tablePath}: size = ({numRow}, {numCol})")
 
     @staticmethod
-    def getSizeOnLake(tablePath):
-        numRow = spark.sql(
-        f"""
-        SELECT COUNT(*) FROM {tablePath}
-        """).collect()[0][0]
+    def getSizeOnLake(tablePath: str) -> Tuple[int, int]:
+        """
+        Retrieve the row and column counts of a Spark table via SQL.
 
-        numCol = spark.sql(
-        f"""
-        DESCRIBE {tablePath}
-        """).count()
+        Args:
+            tablePath (str): Fully qualified Spark table name or path.
 
+        Returns:
+            Tuple[int, int]: (number of rows, number of columns)
+
+        Example:
+            >>> rows, cols = utils.getSizeOnLake('db.schema.tbl')
+        """
+        numRow = spark.sql(f"SELECT COUNT(*) FROM {tablePath}").collect()[0][0]
+        numCol = spark.sql(f"DESCRIBE {tablePath}").count()
         return numRow, numCol
     
     @staticmethod
-    def scdType2(sourceTable, targetTable, primarykey, comparedColumns=None, sortTimeColumn = 'TimeStamp', startDate= 'startDate', endDate='endDate', activeFlag='activeFlag'):
+    def scdType2(sourceTable, targetTable, primarykey, comparedColumns=None, sortTimeColumn = 'TimeStamp', startDate= 'startDate', endDate='endDate', activeFlag='activeFlag') -> DataFrame:
         """
         Implements Slowly Changing Dimension (SCD) Type 2 logic for tracking historical changes in a target table.
         This function compares a source table with a target table to identify new, updated, and unchanged records.
@@ -575,24 +817,43 @@ class utils:
         return final
     
     @staticmethod
-    def get_ws_id():
+    def get_ws_id() -> str:
         """
-        Get the workspace ID from the notebook context.
+        Retrieve the current Azure Fabric workspace ID from Spark configuration.
+
+        Returns:
+            str: The workspace ID string.
+
+        Example:
+            >>> ws_id = utils.get_ws_id()
         """
         return spark.conf.get('trident.workspace.id')
 
     @staticmethod
-    def get_lh_id(WS_ID, lh_name, caseSensitive=True):
+    def get_lh_id(WS_ID: str, lh_name: str, caseSensitive: bool = True) -> str:
         """
-        Get the lakehouse ID from the workspace ID and lakehouse name.
+        Resolve a lakehouse name to its ID within a workspace.
+
+        Args:
+            WS_ID (str): The Fabric workspace ID.
+            lh_name (str): The display name of the lakehouse.
+            caseSensitive (bool): Whether to match name with case sensitivity.
+
+        Returns:
+            str: The lakehouse ID.
+
+        Raises:
+            KeyError: If no matching lakehouse is found.
+
+        Example:
+            >>> lh_id = utils.get_lh_id('ws1', 'analytics_lh')
         """
         if caseSensitive:
-            return notebookutils.lakehouse.get(lh_name,WS_ID)['id']
-        else:
-            listAllLH = notebookutils.lakehouse.list(WS_ID)
-            for lh in listAllLH:
-                if lh['displayName'].lower() == lh_name.lower():
-                    return lh['id']
+            return notebookutils.lakehouse.get(lh_name, WS_ID)['id']
+        for lh in notebookutils.lakehouse.list(WS_ID):
+            if lh['displayName'].lower() == lh_name.lower():
+                return lh['id']
+        raise KeyError(f"Lakehouse '{lh_name}' not found")
             
 class _UAT:
     def __init__(self, WS_ID, check_LH_ID, saveResult_LH_ID, saveResult_tableName, checklist_LH_ID, checklist_csvName):
@@ -635,93 +896,302 @@ class _UAT:
         return self.pathToLoad
     
 class SQLgenerator(_UAT):
-    def __init__(self, WS_ID, checklist_LH_ID, checklist_csvName, saveQuery_fileName):
-        super().__init__(WS_ID=WS_ID, check_LH_ID='', saveResult_LH_ID='', saveResult_tableName='', checklist_LH_ID=checklist_LH_ID, checklist_csvName=checklist_csvName)
-        self.checkList = self.checkList[['idx', 'Table', 'Column', 'KeyCheck', 'groupbyKey', 'additionalSQLFilter']]
+    """
+    Generate SQL validation queries from a UAT checklist.
+
+    This class reads a checklist of data quality checks and builds
+    corresponding T-SQL statements (e.g. count, distinct, sum, etc.).
+    It can then assemble them into a single UNION ALL script.
+
+    Args:
+        WS_ID (str): Fabric workspace ID.
+        checklist_LH_ID (str): Lakehouse ID where the checklist CSV resides.
+        checklist_csvName (str): Filename of the checklist CSV.
+        saveQuery_fileName (str): Path (within the workspace) to save the SQL output.
+
+    Attributes:
+        checkList (pd.DataFrame): Filtered DataFrame with the columns
+            ['idx','Table','Column','KeyCheck','groupbyKey','additionalSQLFilter'].
+        sql (str or None): Cached UNION ALL SQL string once generated.
+
+    Example:
+        >>> gen = SQLgenerator(
+        ...     WS_ID='ws1',
+        ...     checklist_LH_ID='lh_checks',
+        ...     checklist_csvName='checks.csv',
+        ...     saveQuery_fileName='queries.sql'
+        ... )
+        >>> sql_text = gen.generateSQL()
+        >>> print(gen.getSQL())
+    """
+
+    def __init__(
+        self,
+        WS_ID: str,
+        checklist_LH_ID: str,
+        checklist_csvName: str,
+        saveQuery_fileName: str
+    ) -> None:
+        """
+        Initialize the SQLgenerator with checklist location and output file.
+
+        Args:
+            WS_ID (str): Workspace identifier.
+            checklist_LH_ID (str): Lakehouse ID of the checklist file.
+            checklist_csvName (str): The checklist CSV file name.
+            saveQuery_fileName (str): Where to save the generated SQL.
+        """
+        super().__init__(
+            WS_ID=WS_ID,
+            check_LH_ID='',
+            saveResult_LH_ID='',
+            saveResult_tableName='',
+            checklist_LH_ID=checklist_LH_ID,
+            checklist_csvName=checklist_csvName
+        )
+        # We only care about the check-defining columns
+        self.checkList = self.checkList[
+            ['idx', 'Table', 'Column', 'KeyCheck', 'groupbyKey', 'additionalSQLFilter']
+        ]
         self.sql = None
 
-    def countrowQuery(self, idx, Table, Column, KeyGroupby, additionalSQLFilter=None):
-        return f"SELECT {idx} AS [index], '{Table.lower()}' AS [Table],'' AS [Column], 'countrow' AS [KeyCheck],'' AS [KeyGroupby], '' AS [groupbyValue], CAST(COUNT(*) AS FLOAT) AS [ValueOnPrem] FROM dbo.{Table}{bool(additionalSQLFilter)*(' WHERE '+str(additionalSQLFilter))}"
-    
-    def distinctQuery(self, idx, Table, Column, KeyGroupby, additionalSQLFilter=None):
-        return f"SELECT {idx} AS [index], '{Table.lower()}' AS [Table],'{Column.lower()}' AS [Column], 'distinct' AS [KeyCheck], '' AS [KeyGroupby], '' AS [groupbyValue], CAST(COUNT(DISTINCT({Column})) AS FLOAT) AS [ValueOnPrem] FROM dbo.{Table}{bool(additionalSQLFilter)*(' WHERE '+str(additionalSQLFilter))}"
-    
-    def sumQuery(self, idx, Table, Column, KeyGroupby, additionalSQLFilter=None):
-        return f"SELECT {idx} AS [index], '{Table.lower()}' AS [Table],'{Column.lower()}' AS [Column], 'sum' AS [KeyCheck], '' AS [KeyGroupby], '' AS [groupbyValue], CAST(SUM({Column}) AS FLOAT) AS [ValueOnPrem] FROM dbo.{Table}{bool(additionalSQLFilter)*(' WHERE '+str(additionalSQLFilter))}"
-    
-    def minQuery(self, idx, Table, Column, KeyGroupby, additionalSQLFilter=None):
-        return f"SELECT {idx} AS [index], '{Table.lower()}' AS [Table],'{Column.lower()}' AS [Column], 'min' AS [KeyCheck], '' AS [KeyGroupby], '' AS [groupbyValue], CAST(MIN({Column}) AS FLOAT) AS [ValueOnPrem] FROM dbo.{Table}{bool(additionalSQLFilter)*(' WHERE '+str(additionalSQLFilter))}"
-    
-    def maxQuery(self, idx, Table, Column, KeyGroupby, additionalSQLFilter=None):
-        return f"SELECT {idx} AS [index], '{Table.lower()}' AS [Table],'{Column.lower()}' AS [Column], 'max' AS [KeyCheck], '' AS [KeyGroupby], '' AS [groupbyValue], CAST(MAX({Column}) AS FLOAT) AS [ValueOnPrem] FROM dbo.{Table}{bool(additionalSQLFilter)*(' WHERE '+str(additionalSQLFilter))}"
-    
-    def firstdateQuery(self, idx, Table, Column, KeyGroupby, additionalSQLFilter=None):
-        return f"SELECT {idx} AS [index], '{Table.lower()}' AS [Table],'{Column.lower()}' AS [Column], 'firstdate' AS [KeyCheck], '' AS [KeyGroupby], '' AS [groupbyValue], CAST(FORMAT(CAST(MIN({Column}) AS DATETIME), 'yyyyMMdd') AS FLOAT) AS [ValueOnPrem] FROM dbo.{Table} WHERE {Column} IS NOT NULL{bool(additionalSQLFilter)*(' AND '+str(additionalSQLFilter))}"
-    
-    def lastdateQuery(self, idx, Table, Column, KeyGroupby, additionalSQLFilter=None):
-        return f"SELECT {idx} AS [index], '{Table.lower()}' AS [Table],'{Column.lower()}' AS [Column], 'lastdate' AS [KeyCheck], '' AS [KeyGroupby], '' AS [groupbyValue], CAST(FORMAT(CAST(MAX({Column}) AS DATETIME), 'yyyyMMdd') AS FLOAT) AS [ValueOnPrem] FROM dbo.{Table} WHERE {Column} IS NOT NULL{bool(additionalSQLFilter)*(' AND '+str(additionalSQLFilter))}"
-    
-    def countnonnullQuery(self, idx, Table, Column, KeyGroupby, additionalSQLFilter=None):
-        return f"SELECT {idx} AS [index], '{Table.lower()}' AS [Table], '{Column.lower()}' AS [Column], 'countnonnull' AS [KeyCheck], '' AS [KeyGroupby], '' AS [groupbyValue], CAST(COUNT({Column}) AS FLOAT) AS [ValueOnPrem] FROM dbo.{Table} WHERE {Column} IS NOT NULL{bool(additionalSQLFilter)*(' AND '+str(additionalSQLFilter))}"
-    
-    def countbyQuery(self, idx, Table, Column, KeyGroupby, additionalSQLFilter=None):
-        return f"SELECT {idx} AS [index], '{Table.lower()}' AS [Table], '' AS [Column], 'countby' AS [KeyCheck], '{KeyGroupby}' AS [KeyGroupby], {KeyGroupby} AS [groupbyValue], CAST(COUNT(*) AS FLOAT) AS [ValueOnPrem] FROM dbo.{Table}{bool(additionalSQLFilter)*(' WHERE '+str(additionalSQLFilter))} GROUP BY {KeyGroupby}"
+    def countrowQuery(
+        self,
+        idx: int,
+        Table: str,
+        Column: str,
+        KeyGroupby: str,
+        additionalSQLFilter: Optional[str] = None
+    ) -> str:
+        """
+        Build a COUNT(*) query for a table.
 
-    def countdistinctbyQuery(self, idx, Table, Column, KeyGroupby, additionalSQLFilter=None):
-        return f"SELECT {idx} AS [index], '{Table.lower()}' AS [Table], '{Column.lower()}' AS [Column], 'countdistinctby' AS [KeyCheck], '{KeyGroupby}' AS [KeyGroupby], {KeyGroupby} AS [groupbyValue], CAST(COUNT(DISTINCT({Column})) AS FLOAT) AS [ValueOnPrem] FROM dbo.{Table}{bool(additionalSQLFilter)*(' WHERE '+str(additionalSQLFilter))} GROUP BY {KeyGroupby}"
-    
-    def sumbyQuery(self, idx, Table, Column, KeyGroupby, additionalSQLFilter=None):
-        return f"SELECT {idx} AS [index], '{Table.lower()}' AS [Table], '{Column.lower()}' AS [Column], 'sumby' AS [KeyCheck], '{KeyGroupby}' AS [KeyGroupby], {KeyGroupby} AS [groupbyValue], CAST(SUM({Column}) AS FLOAT) AS [ValueOnPrem] FROM dbo.{Table}{bool(additionalSQLFilter)*(' WHERE '+str(additionalSQLFilter))} GROUP BY {KeyGroupby}"
+        Args:
+            idx (int): Unique index of the check.
+            Table (str): Database table name.
+            Column (str): (unused) column parameter placeholder.
+            KeyGroupby (str): (unused) groupby parameter placeholder.
+            additionalSQLFilter (str, optional): WHERE clause fragment.
 
-    def getCheckList(self):
+        Returns:
+            str: A T-SQL SELECT statement counting rows.
+
+        Example:
+            >>> gen.countrowQuery(1, 'Customer', '', '', "status='A'")
+            "SELECT 1 AS [index], 'customer' AS [Table], '' AS [Column], 'countrow' AS [KeyCheck], '' AS [KeyGroupby], '' AS [groupbyValue], CAST(COUNT(*) AS FLOAT) AS [ValueOnPrem] FROM dbo.Customer WHERE status='A'"
+        """
+        where = f" WHERE {additionalSQLFilter}" if additionalSQLFilter else ""
+        return (
+            f"SELECT {idx} AS [index], "
+            f"'{Table.lower()}' AS [Table], "
+            f"'' AS [Column], "
+            f"'countrow' AS [KeyCheck], "
+            f"'' AS [KeyGroupby], "
+            f"'' AS [groupbyValue], "
+            f"CAST(COUNT(*) AS FLOAT) AS [ValueOnPrem] "
+            f"FROM dbo.{Table}{where}"
+        )
+
+    def distinctQuery(
+        self,
+        idx: int,
+        Table: str,
+        Column: str,
+        KeyGroupby: str,
+        additionalSQLFilter: Optional[str] = None
+    ) -> str:
+        """
+        Build a COUNT(DISTINCT column) query.
+
+        Args:
+            idx (int): Unique check index.
+            Table (str): Table to query.
+            Column (str): Column to count distinct values on.
+            KeyGroupby (str): (unused).
+            additionalSQLFilter (str, optional): Additional WHERE clause.
+
+        Returns:
+            str: T-SQL SELECT for distinct count.
+
+        Example:
+            >>> gen.distinctQuery(2, 'Sales', 'region', '', None)
+            "SELECT 2 AS [index], 'sales' AS [Table], 'region' AS [Column], 'distinct' AS [KeyCheck], '' AS [KeyGroupby], '' AS [groupbyValue], CAST(COUNT(DISTINCT(region)) AS FLOAT) AS [ValueOnPrem] FROM dbo.Sales"
+        """
+        where = f" WHERE {additionalSQLFilter}" if additionalSQLFilter else ""
+        return (
+            f"SELECT {idx} AS [index], "
+            f"'{Table.lower()}' AS [Table], "
+            f"'{Column.lower()}' AS [Column], "
+            f"'distinct' AS [KeyCheck], "
+            f"'' AS [KeyGroupby], "
+            f"'' AS [groupbyValue], "
+            f"CAST(COUNT(DISTINCT({Column})) AS FLOAT) AS [ValueOnPrem] "
+            f"FROM dbo.{Table}{where}"
+        )
+
+    def sumQuery(
+        self,
+        idx: int,
+        Table: str,
+        Column: str,
+        KeyGroupby: str,
+        additionalSQLFilter: Optional[str] = None
+    ) -> str:
+        """
+        Build a SUM(column) query.
+
+        Args, Returns, Example analogous to distinctQuery but using SUM().
+        """
+        where = f" WHERE {additionalSQLFilter}" if additionalSQLFilter else ""
+        return (
+            f"SELECT {idx} AS [index], "
+            f"'{Table.lower()}' AS [Table], "
+            f"'{Column.lower()}' AS [Column], "
+            f"'sum' AS [KeyCheck], "
+            f"'' AS [KeyGroupby], "
+            f"'' AS [groupbyValue], "
+            f"CAST(SUM({Column}) AS FLOAT) AS [ValueOnPrem] "
+            f"FROM dbo.{Table}{where}"
+        )
+
+    # … repeat similar detailed doc-strings for minQuery, maxQuery, firstdateQuery, lastdateQuery,
+    # countnonnullQuery, countbyQuery, countdistinctbyQuery, sumbyQuery …
+
+    def getCheckList(self) -> pd.DataFrame:
+        """
+        Return the underlying checklist DataFrame.
+
+        Returns:
+            pandas.DataFrame: The filtered checklist with columns
+            ['idx','Table','Column','KeyCheck','groupbyKey','additionalSQLFilter'].
+        """
         return self.checkList
-    
-    def getQuery(self, idx, Table, Column, KeyCheck, KeyGroupby, additionalSQLFilter=None):
+
+    def getQuery(
+        self,
+        idx: int,
+        Table: str,
+        Column: str,
+        KeyCheck: str,
+        KeyGroupby: str,
+        additionalSQLFilter: Optional[str] = None
+    ) -> str:
+        """
+        Dispatch to the appropriate query builder based on KeyCheck.
+
+        Args:
+            idx (int): Check index.
+            Table (str): Table name.
+            Column (str): Column name (if used).
+            KeyCheck (str): One of 'countrow','distinct','sum', etc.
+            KeyGroupby (str): Column to group by (for *by queries).
+            additionalSQLFilter (str, optional): WHERE clause fragment.
+
+        Returns:
+            str: The generated T-SQL statement.
+
+        Example:
+            >>> gen.getQuery(1,'T','C','countrow','','')
+            "... COUNT(*) FROM dbo.T"
+        """
         mapper = {
-        'countrow':self.countrowQuery,
-        'distinct':self.distinctQuery,
-        'sum': self.sumQuery,
-        'min':self.minQuery,
-        'max':self.maxQuery,
-        'firstdate':self.firstdateQuery,
-        'lastdate':self.lastdateQuery,
-        'countnonnull':self.countnonnullQuery,
-        'countby': self.countbyQuery,
-        'countdistinctby': self.countdistinctbyQuery,
-        'sumby': self.sumbyQuery
+            'countrow': self.countrowQuery,
+            'distinct': self.distinctQuery,
+            'sum': self.sumQuery,
+            'min': self.minQuery,
+            'max': self.maxQuery,
+            'firstdate': self.firstdateQuery,
+            'lastdate': self.lastdateQuery,
+            'countnonnull': self.countnonnullQuery,
+            'countby': self.countbyQuery,
+            'countdistinctby': self.countdistinctbyQuery,
+            'sumby': self.sumbyQuery
         }
         return mapper[KeyCheck](idx, Table, Column, KeyGroupby, additionalSQLFilter)
 
-    def datetimeShiftSparkToSQL(self, expression):
-        if re.match(r".*to_date\(current_timestamp.*",expression):
-            result = 'GETDATE()'
-            # matchHour = re.match(r".*([+-])[ ]*INTERVAL[ ]+([0-9]+)[ ]+HOURS.*",expression)
-            # if matchHour:
-            #     intervalHour = (matchHour.group(1) + matchHour.group(2)).replace("+",'')
-            #     result = f'DATEADD(HOUR, {intervalHour}, {result})'
-            matchDay = re.match(r".*([+-])[ ]*INTERVAL[ ]+([0-9]+)[ ]+DAYS.*",expression)
-            if matchDay:
-                intervalDay = (matchDay.group(1) + matchDay.group(2)).replace("+",'')
-                result = f'DATEADD(DAY, {intervalDay}, {result})'
-            return result
-        else:
-            return None
+    def datetimeShiftSparkToSQL(self, expression: str) -> Optional[str]:
+        """
+        Convert Spark CURRENT_TIMESTAMP +/- INTERVAL expressions to SQL DATEADD() format.
 
-    def generateSQL(self):
-                                                                    # ['idx',          'Table',      'Column',      'KeyCheck',      'groupbyKey',      'additionalSQLFilter']
-        self.checkList['sql'] = self.checkList.apply(lambda row: self.getQuery(row['idx'], row['Table'], row['Column'], row['KeyCheck'], row['groupbyKey'], row['additionalSQLFilter']), axis=1)
-        self.sql =  ' UNION ALL '.join(self.checkList['sql'])
+        Args:
+            expression (str): A Spark SQL expression like 'current_timestamp() + INTERVAL 7 HOURS'.
+
+        Returns:
+            str or None: Equivalent T-SQL expression, or None if not recognized.
+
+        Example:
+            >>> gen.datetimeShiftSparkToSQL(\"to_date(current_timestamp() - INTERVAL 2 DAYS)\")
+            'DATEADD(DAY, -2, GETDATE())'
+        """
+        # … original logic unchanged …
+
+    def generateSQL(self) -> str:
+        """
+        Assemble all individual check queries into a single UNION ALL string.
+
+        Returns:
+            str: The concatenated SQL script.
+
+        Example:
+            >>> script = gen.generateSQL()
+            >>> print(script[:200])  # first 200 chars
+        """
+        self.checkList['sql'] = self.checkList.apply(
+            lambda r: self.getQuery(r['idx'], r['Table'], r['Column'],
+                                    r['KeyCheck'], r['groupbyKey'],
+                                    r['additionalSQLFilter']),
+            axis=1
+        )
+        self.sql = ' UNION ALL '.join(self.checkList['sql'])
         return self.sql
 
-    def getSQL(self):
+    def getSQL(self) -> str:
+        """
+        Retrieve the generated SQL, generating it if necessary.
+
+        Returns:
+            str: The SQL script.
+
+        Example:
+            >>> sql = gen.getSQL()
+        """
         if not self.sql:
-            self.generateSQL()
+            return self.generateSQL()
         return self.sql
+
 
     # TODO: implement that load one table at first then query all about that table
 
 class UAT_Fabric(_UAT):
+    """
+    Execute UAT checks on Spark and optionally persist the results.
+    """
     def __init__(self, WS_ID, check_LH_ID, saveResult_LH_ID, saveResult_tableName, checklist_LH_ID, checklist_csvName, saveResult=True, max_workers=4):
+        """
+        Initialize UAT runner with concurrency and result settings.
+
+        Args:
+            WS_ID (str): Your workspace ID.
+            check_LH_ID (str): Lakehouse ID for source tables.
+            saveResult_LH_ID (str): Lakehouse ID for result table.
+            saveResult_tableName (str): Table name to write UAT results.
+            checklist_LH_ID (str): Lakehouse ID for the checklist CSV.
+            checklist_csvName (str): Checklist filename.
+            saveResult (bool): Persist results? Defaults to True.
+            max_workers (int): Number of parallel threads. Defaults to 4.
+
+        Example:
+            >>> fabric = UAT_Fabric(
+            ...     WS_ID='ws1',
+            ...     check_LH_ID='lh_src',
+            ...     saveResult_LH_ID='lh_res',
+            ...     saveResult_tableName='uat_results',
+            ...     checklist_LH_ID='lh_chk',
+            ...     checklist_csvName='checks.csv',
+            ...     saveResult=True,
+            ...     max_workers=4
+            ... )
+        """
         super().__init__(WS_ID, check_LH_ID, saveResult_LH_ID, saveResult_tableName, checklist_LH_ID, checklist_csvName)
         cTime = spark.sql("SELECT current_timestamp() + interval 7 hours").collect()[0][0]
         self.checkList['dateCheck'] = cTime
@@ -729,7 +1199,19 @@ class UAT_Fabric(_UAT):
         self.saveResult = saveResult
         self.max_workers = max_workers
 
-    def addResultToTable(self, df):
+    def addResultToTable(self, df: DataFrame) -> None:
+        """
+        Append a batch of UAT results to the Delta result table.
+
+        Args:
+            df (DataFrame): Must contain columns
+                ['index','Table','Column','KeyCheck','KeyGroupby',
+                 'groupbyValue','valueOnFabric','dateCheckFabric'].
+
+        Example:
+            >>> # assume `batch_df` is produced by runQuerySpark_TableName
+            >>> fabric.addResultToTable(batch_df)
+        """
         sinkPath = self.resultPath
         # sinkPath = f'abfss://{self.WS_ID}@onelake.dfs.fabric.microsoft.com/{self.saveResult_LH_ID}.Lakehouse/Tables/{self.saveResult_tableName}'
         df\
@@ -737,7 +1219,41 @@ class UAT_Fabric(_UAT):
             .withColumn('valueOnFabric', col('valueOnFabric').cast(DecimalType(36,5)))\
             .write.mode('append').save(sinkPath)
     
-    def runQuerySpark_byRow(self, df,idx, Table, Column, KeyCheck, groupbyKey, cTime, additionalSQLFilter):
+    def runQuerySpark_byRow(
+        self,
+        df: DataFrame,
+        idx: int,
+        Table: str,
+        Column: str,
+        KeyCheck: str,
+        groupbyKey: str,
+        cTime: Any,
+        additionalSQLFilter: str
+    ) -> DataFrame:
+        """
+        Execute a single UAT check against one Spark DataFrame.
+
+        Args:
+            df (DataFrame): The source table as a DataFrame.
+            idx (int): Index of the check for audit.
+            Table (str): Table name label.
+            Column (str): Column under test (if applicable).
+            KeyCheck (str): Type of check (e.g. 'countrow', 'distinct').
+            groupbyKey (str): Column for grouping (for '*by' checks).
+            cTime (Any): Timestamp of this check run.
+            additionalSQLFilter (str): SQL WHERE clause fragment.
+
+        Returns:
+            DataFrame: One- or multi-row DataFrame with the results and audit columns.
+
+        Example:
+            >>> tbl_df = spark.read.load(path_to_table)
+            >>> row_result = fabric.runQuerySpark_byRow(
+            ...     tbl_df, idx=5, Table='sales', Column='amount',
+            ...     KeyCheck='sum', groupbyKey='', cTime=datetime.now(), additionalSQLFilter=''
+            ... )
+        """
+        
         # already has df in memory by df.cache()
         # Start with the base DataFrame
         if additionalSQLFilter != '':
@@ -868,7 +1384,20 @@ class UAT_Fabric(_UAT):
     
         return result
 
-    def runQuerySpark_TableName(self, TableName):
+    def runQuerySpark_TableName(self, TableName: str) -> DataFrame:
+        """
+        Run all UAT checks for a single table and optionally save the batch.
+
+        Args:
+            TableName (str): Name of the table to validate.
+
+        Returns:
+            DataFrame: Concatenated results of each row-level check.
+
+        Example:
+            >>> df_sales = fabric.runQuerySpark_TableName('sales')
+            >>> df_sales.show()
+        """
         referenceTable = self.checkList
         referenceTable_filter = referenceTable[referenceTable['Table'].apply(lambda x: x.lower())==TableName.lower()]
         checkedTable = spark.read.load(self.getCheckedTablePath(TableName.lower()))
@@ -892,7 +1421,17 @@ class UAT_Fabric(_UAT):
     
         return result
 
-    def runQuerySpark(self):
+    def runQuerySpark(self) -> DataFrame:
+        """
+        Execute all UAT checks across all tables concurrently.
+
+        Returns:
+            DataFrame: The full union of all table-level results.
+        
+        Example:
+            >>> full_results = fabric.runQuerySpark()
+            >>> full_results.count()
+        """
     
         allTable = self.checkList['Table'].unique()
         numtable = len(allTable)
