@@ -777,9 +777,9 @@ class utils:
         ...     (2, "B", "2024-06-01 11:00:00"),
         ... ], ["id", "value", "TimeStamp"])
         >>> target = spark.createDataFrame([
-        ...     (1, "A", "2024-05-01", "9999-12-31", True),
-        ...     (2, "C", "2024-05-01", "9999-12-31", True),
-        ... ], ["id", "value", "startDate", "endDate", "activeFlag"])
+        ...     (1, "A", "2024-05-01", "9999-12-31","2024-03-01 10:00:00",  True),
+        ...     (2, "C", "2024-05-01", "9999-12-31","2024-03-01 11:00:00", True),
+        ... ], ["id", "value", "startDate", "endDate", "TimeStamp", "activeFlag"])
         >>> result = scdType2(
         ...     sourceTable=source,
         ...     targetTable=target,
