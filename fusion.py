@@ -455,7 +455,19 @@ class CreateBlankTable:
 
                 column_datatype_map[column_name] = datatype
                 if datatype == DecimalType:
-                    precision_scale_map[column_name] = (row['Precision'], row['Scale'])
+    
+                    # coerce back to int, with defaults if missing
+                    raw_p = row['Precision']
+                    raw_s = row['Scale']
+                    try:
+                        p = int(raw_p)
+                    except (TypeError, ValueError):
+                        p = 38
+                    try:
+                        s = int(raw_s)
+                    except (TypeError, ValueError):
+                        s = 18
+                    precision_scale_map[column_name] = (p, s)
                 if row['forPartition'] == 1:
                     table_partition_columns.append(column_name)
             self.create_table(table, lakehouse_name, column_datatype_map, precision_scale_map, table_partition_columns)
